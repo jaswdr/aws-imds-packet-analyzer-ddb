@@ -6,3 +6,4 @@ python3 -m pytest tests/ -v
 rm -r .pytest_cache
 rm -r src/__pycache__
 rm -r tests/__pycache__
+

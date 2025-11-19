@@ -1,4 +1,4 @@
-#!/usr/bin/python3
+#!/usr/bin/env python3
 # Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
 # SPDX-License-Identifier: Apache-2.0
 
@@ -7,15 +7,159 @@ import os
 import logging
 from logging.handlers import RotatingFileHandler
 from logging.config import fileConfig
+import argparse
+import queue
+import threading
+import uuid
+import datetime
+import socket
+import boto3
+import botocore.exceptions
+import time
 
 EC_METADATA_TOKEN_ = "x-aws-ec2-metadata-token:"
 
-LOGGING_CONFIG_FILE = 'logging.conf'
+LOGGING_CONFIG_FILE = "logging.conf"
 LOG_IMDS_FOLDER = "/var/log/imds"
 
 # GLOBAL => set logger object as global because initializing the logger in the bpf callback function could
 # cause unnecessary overhead
 logger = None
+
+
+class DynamoDBLogHandler(logging.Handler):
+    def __init__(self, table_name, region=None, retention_days=30):
+        super().__init__()
+        self.table_name = table_name
+        self.region = region
+        self.retention_days = int(retention_days)
+        self.hostname = socket.gethostname()
+        self.log_queue = queue.Queue()
+
+        # Initialize DynamoDB resource
+        print(
+            f"[DEBUG] DynamoDBLogHandler.__init__: Initializing (table={table_name}, region={region}, retention={self.retention_days})",
+            flush=True,
+        )
+        try:
+            if region:
+                self.dynamodb = boto3.resource("dynamodb", region_name=region)
+                print(
+                    f"[DEBUG] DynamoDBLogHandler.__init__: Created DynamoDB resource with region={region}",
+                    flush=True,
+                )
+            else:
+                self.dynamodb = boto3.resource("dynamodb")
+                print(
+                    f"[DEBUG] DynamoDBLogHandler.__init__: Created DynamoDB resource (default region)",
+                    flush=True,
+                )
+            self.table = self.dynamodb.Table(table_name)
+            print(
+                f"[DEBUG] DynamoDBLogHandler.__init__: Got table reference: {self.table}",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"[ERROR] Failed to initialize DynamoDB resource: {e}", flush=True)
+            import traceback
+
+            traceback.print_exc()
+            # We don't raise here to allow file logging to continue if DDB fails init,
+            # but the worker thread won't work properly.
+            # Actually, if we can't init DDB, we should probably know.
+            # But let's just let it fail later or print error.
+            pass
+
+        # Start worker thread
+        self.worker = threading.Thread(target=self._worker, daemon=True)
+        self.worker.start()
+
+    def emit(self, record):
+        try:
+            msg = self.format(record)
+            # Use ISO 8601 format for timestamp
+            timestamp = datetime.datetime.now(datetime.timezone.utc).isoformat()
+            self.log_queue.put(
+                {"msg": msg, "level": record.levelname, "timestamp": timestamp}
+            )
+            print(
+                f"[DEBUG] DynamoDBLogHandler: Queued log entry (level={record.levelname})",
+                flush=True,
+            )
+        except Exception:
+            self.handleError(record)
+
+    def _worker(self):
+        print(
+            f"[DEBUG] DynamoDBLogHandler: Worker thread started (table={self.table_name}, region={self.region})",
+            flush=True,
+        )
+        while True:
+            try:
+                print(
+                    "[DEBUG] DynamoDBLogHandler: Waiting for queue item...", flush=True
+                )
+                item = self.log_queue.get()
+                print(
+                    f"[DEBUG] DynamoDBLogHandler: Got item from queue: {item['level']}",
+                    flush=True,
+                )
+                timestamp = item["timestamp"]
+                # Create unique sort key: timestamp + short uuid
+                sk = f"{timestamp}#{str(uuid.uuid4())[:8]}"
+
+                # Calculate TTL
+                expire_at = int(time.time() + self.retention_days * 86400)
+
+                ddb_item = {
+                    "PK": self.hostname,
+                    "SK": sk,
+                    "message": item["msg"],
+                    "level": item["level"],
+                    "expire_at": expire_at,
+                }
+                print(
+                    f"[DEBUG] DynamoDBLogHandler: Attempting put_item (PK={self.hostname}, SK={sk[:50]}...)",
+                    flush=True,
+                )
+
+                # Retry logic for throttling
+                max_retries = 7
+                for attempt in range(max_retries + 1):
+                    try:
+                        self.table.put_item(Item=ddb_item)
+                        print(
+                            f"[DEBUG] DynamoDBLogHandler: SUCCESS - put_item completed",
+                            flush=True,
+                        )
+                        break  # Success
+                    except botocore.exceptions.ClientError as e:
+                        error_code = e.response.get("Error", {}).get("Code", "")
+                        if error_code in [
+                            "ProvisionedThroughputExceededException",
+                            "ThrottlingException",
+                        ]:
+                            if attempt == max_retries:
+                                print(
+                                    f"[ERROR] Dropped log message after {max_retries} retries due to throttling."
+                                )
+                            else:
+                                sleep_time = 0.1 * (2**attempt)
+                                time.sleep(sleep_time)
+                                continue
+                        else:
+                            print(f"[ERROR] Failed to log to DynamoDB: {e}")
+                            break
+                    except Exception as e:
+                        print(f"[ERROR] Unexpected error logging to DynamoDB: {e}")
+                        break
+
+                self.log_queue.task_done()
+            except Exception as e:
+                # Avoid crashing the worker thread on temporary errors
+                print(f"[ERROR] DynamoDB log worker error: {e}")
+                time.sleep(1)
+
 
 """Check if a IMDS call is a imdsV1/2 call
 
@@ -24,12 +168,18 @@ logger = None
 :returns: is_v2
 :rtype is_v2: bool
 """
+
+
 def check_v2(payload: str, is_debug=False) -> bool:
-    if (is_debug):
-        print("========================================================================")
+    if is_debug:
+        print(
+            "========================================================================"
+        )
         print("[DEBUG] Payload being checked: ")
         print(payload, end="\n")
-        print("========================================================================")
+        print(
+            "========================================================================"
+        )
 
     IMDSV2_TOKEN_PREFIX = "x-aws-ec2-metadata-token"
 
@@ -38,16 +188,18 @@ def check_v2(payload: str, is_debug=False) -> bool:
     if IMDSV2_TOKEN_PREFIX in payload.lower():
         is_v2 = True
 
-    return (is_v2)
+    return is_v2
 
 
-"""Remove the token from the message 
+"""Remove the token from the message
 
 :param comms: message that need to be redacted.
 :type: str
 :returns: redacted message
 :rtype: str
 """
+
+
 def hideToken(comms: str) -> str:
     startToken = comms.find(EC_METADATA_TOKEN_)
     endToken = comms.find("==", startToken) + len("==")
@@ -59,12 +211,14 @@ def hideToken(comms: str) -> str:
 
     return newTxt
 
+
 def recurseHideToken(comms: str) -> str:
     newTxt = comms.lower()
     while newTxt.find(EC_METADATA_TOKEN_) >= 0:
         newTxt = hideToken(newTxt)
 
     return newTxt
+
 
 """ get argv info per calling process
 
@@ -75,22 +229,28 @@ def recurseHideToken(comms: str) -> str:
 :returns: proc_info
 :rtype proc_info: str
 """
+
+
 def get_proc_info(pid: int, proc_name: str, is_debug=False) -> str:
-    if (is_debug):
-        print("========================================================================")
+    if is_debug:
+        print(
+            "========================================================================"
+        )
         print("[DEBUG] pid: " + str(pid))
         print("proc_name: " + proc_info, end="\n")
-        print("========================================================================")
+        print(
+            "========================================================================"
+        )
 
     try:
         cmdline = open("/proc/" + str(pid) + "/cmdline").read()
         proc_info = ":" + proc_name
-        proc_info += " argv:" + cmdline.replace('\x00', ' ').rstrip()
-        return (proc_info)
+        proc_info += " argv:" + cmdline.replace("\x00", " ").rstrip()
+        return proc_info
     except Exception as e:
         print("Info: ", e)
         error_message = " Unable to get argv information"
-        return (error_message)
+        return error_message
 
 
 """ generate output message per imds network call
@@ -102,27 +262,44 @@ def get_proc_info(pid: int, proc_name: str, is_debug=False) -> str:
 :returns: log_msg
 :rtype log_msg: str
 """
+
+
 def gen_log_msg(is_v2: bool, event) -> str:
-          
+
     entry_init = "(pid:"
     log_msg = "IMDSv2 " if is_v2 else "IMDSv1(!) "
 
-    log_msg += entry_init + \
-        str(event.pid[0]) + get_proc_info(event.pid[0],
-                                          event.comm.decode()) + ")"
+    log_msg += (
+        entry_init
+        + str(event.pid[0])
+        + get_proc_info(event.pid[0], event.comm.decode())
+        + ")"
+    )
 
     if event.parent_comm and event.pid[1]:
-        log_msg += " called by -> " + entry_init + \
-            str(event.pid[1]) + get_proc_info(event.pid[1],
-                                              event.parent_comm.decode()) + ")"
+        log_msg += (
+            " called by -> "
+            + entry_init
+            + str(event.pid[1])
+            + get_proc_info(event.pid[1], event.parent_comm.decode())
+            + ")"
+        )
         if event.gparent_comm and event.pid[2]:
-            log_msg += " -> " + entry_init + \
-                str(event.pid[2]) + get_proc_info(event.pid[2],
-                                                  event.gparent_comm.decode()) + ")"
+            log_msg += (
+                " -> "
+                + entry_init
+                + str(event.pid[2])
+                + get_proc_info(event.pid[2], event.gparent_comm.decode())
+                + ")"
+            )
             if event.ggparent_comm and event.pid[3]:
-                log_msg += " -> " + entry_init + \
-                    str(event.pid[3]) + get_proc_info(event.pid[3],
-                                                      event.ggparent_comm.decode()) + ")"
+                log_msg += (
+                    " -> "
+                    + entry_init
+                    + str(event.pid[3])
+                    + get_proc_info(event.pid[3], event.ggparent_comm.decode())
+                    + ")"
+                )
 
     return log_msg
 
@@ -147,10 +324,10 @@ def print_imds_event(cpu, data, size):
   :attribute pkt: the data payload contained in a network request of request
   :type pkt: bytes (specific encoding unknown)
   :attribute contains_payload: flag to indicate if the event has a viable payload to analyze or not
-  :type contains_payload: int (u32) 
+  :type contains_payload: int (u32)
   """
     # pass whatever data bcc has captured as the event payload to test IMDSv1/2?
-    is_v2 = check_v2(event.pkt[:event.pkt_size].decode())
+    is_v2 = check_v2(event.pkt[: event.pkt_size].decode())
     # generate information string to be logged
     log_msg = gen_log_msg(is_v2, event)
     pkt_size = event.pkt_size
@@ -158,80 +335,147 @@ def print_imds_event(cpu, data, size):
     log_msg = log_msg + " Req details: " + ", ".join(payload.splitlines())
     log_msg = recurseHideToken(log_msg)
 
-    if(event.contains_payload):
-      # log identifiable trace info
-      if(is_v2):
-        logger.info(log_msg)
-        print('[INFO] ' + log_msg, end="\n")
-      else:
-        logger.warning(log_msg)
-        print('[WARNING] ' + log_msg, end="\n")
+    if event.contains_payload:
+        # log identifiable trace info
+        if is_v2:
+            logger.info(log_msg)
+            print("[INFO] " + log_msg, end="\n")
+        else:
+            logger.warning(log_msg)
+            print("[WARNING] " + log_msg, end="\n")
     else:
-      # unidentifiable call -> needs further attention -> hence log at error level
-      log_msg = "{MISSING PAYLOAD} " + log_msg
-      logger.error(log_msg)
-      print('[ERROR] ' + log_msg, end="\n")
+        # unidentifiable call -> needs further attention -> hence log at error level
+        log_msg = "{MISSING PAYLOAD} " + log_msg
+        logger.error(log_msg)
+        print("[ERROR] " + log_msg, end="\n")
 
 
-if(__name__ == "__main__"):
-  if os.geteuid() != 0:
-    exit("You need to have root privileges to run this script.")
+def parse_args():
+    parser = argparse.ArgumentParser(description="AWS IMDS Packet Analyzer")
+    parser.add_argument(
+        "--ddb-table", help="Name of the DynamoDB table to log to", required=False
+    )
+    parser.add_argument("--aws-region", help="AWS region for DynamoDB", required=False)
+    parser.add_argument(
+        "--ddb-retention-days",
+        help="Retention period in days for DynamoDB items (default: 30)",
+        type=int,
+        default=30,
+        required=False,
+    )
+    return parser.parse_args()
 
-  # create and lock down the logging folder, since root is running the trace, only root can view the log
-  if not os.path.exists(LOG_IMDS_FOLDER):
-    os.makedirs(LOG_IMDS_FOLDER)
 
-  st = os.stat(LOG_IMDS_FOLDER)
-  if bool(st.st_mode & 0o00077):
-    print("Setting log folder to root RW access only, permission was: " + str(oct(st.st_mode & 0o00777)))
-    os.chmod(LOG_IMDS_FOLDER, 0o600)  # only user RW needed.
+if __name__ == "__main__":
+    print("[INFO] Starting imds_snoop.py...", flush=True)
+    args = parse_args()
+    print(f"[INFO] Arguments: {args}", flush=True)
 
-  # initialize logger
-  if os.path.exists(LOGGING_CONFIG_FILE):
-    print("Using config file as one was provided.")
-    fileConfig(LOGGING_CONFIG_FILE)
-    logger = logging.getLogger()
-  else:  # No config file is preferred as we want to ensure the locked down folder is used.
-    print("Logging to /var/log/imds/imds-trace.log")
-    logger = logging.getLogger()
-    c_handler = RotatingFileHandler('/var/log/imds/imds-trace.log', 'a', 1048576, 5, 'UTF-8')
-    logger.setLevel(logging.INFO)
-    c_format = logging.Formatter('[%(asctime)s] [%(levelname)s] %(message)s')
-    c_handler.setFormatter(c_format)
-    logger.addHandler(c_handler)
+    if os.geteuid() != 0:
+        exit("You need to have root privileges to run this script.")
 
-  # initialize BPF
-  b = BPF('bpf.c')
-  # Instruments the kernel function event() using kernel dynamic tracing of the function entry, and attaches our C
-  # defined function name() to be called when the kernel function is called.
-  #
-  # kernel update https://github.com/torvalds/linux/commit/81d03e2518945c4bc7b9a7b3f1935203954bf3ba cause the event to not fire, trying previous implementation now in `__sock_sendmsg`
-  event_list = ['__sock_sendmsg', 'sock_sendmsg', 'security_socket_sendmsg', 'sock_sendmsg_nosec']
-  logger.info("Try to attach multiple kernel functions to make sure the event can be triggered in most cases.")
-  for event in event_list:
-      try:
-        b.attach_kprobe(event=event, fn_name="trace_sock_sendmsg")
-      except Exception as exec:
-        logger.info("Cannot attach kprobe to {}, it depends on your kernels.".format(event))
+    # create and lock down the logging folder, since root is running the trace, only root can view the log
+    if not os.path.exists(LOG_IMDS_FOLDER):
+        os.makedirs(LOG_IMDS_FOLDER)
 
-  # This operates on a table as defined in BPF via BPF_PERF_OUTPUT() [Defined in C code as imds_events, line 32], and
-  # associates the callback Python function to be called when data is available in the perf ring buffer.
-  b["imds_events"].open_perf_buffer(print_imds_event)
+    st = os.stat(LOG_IMDS_FOLDER)
+    if bool(st.st_mode & 0o00077):
+        print(
+            "Setting log folder to root RW access only, permission was: "
+            + str(oct(st.st_mode & 0o00777))
+        )
+        os.chmod(LOG_IMDS_FOLDER, 0o600)  # only user RW needed.
 
-  # header
-  print("Starting ImdsPacketAnalyzer...")
-  print("Output format: Info Level:[INFO/ERROR...] IMDS version:[IMDSV1/2?] (pid:[pid]:[process name]:argv:[argv]) -> repeats 3 times for parent process")
+    # initialize logger
+    if os.path.exists(LOGGING_CONFIG_FILE):
+        print("Using config file as one was provided.")
+        fileConfig(LOGGING_CONFIG_FILE)
+        logger = logging.getLogger()
+    else:  # No config file is preferred as we want to ensure the locked down folder is used.
+        print("Logging to /var/log/imds/imds-trace.log")
+        logger = logging.getLogger()
+        c_handler = RotatingFileHandler(
+            "/var/log/imds/imds-trace.log", "a", 1048576, 5, "UTF-8"
+        )
+        logger.setLevel(logging.INFO)
+        c_format = logging.Formatter("[%(asctime)s] [%(levelname)s] %(message)s")
+        c_handler.setFormatter(c_format)
+        logger.addHandler(c_handler)
 
-  # filter and format output
-  while 1:
-    # Read messages from kernel pipe
-    try:
-      # This polls from all open perf ring buffers, calling the callback function that was provided when calling
-      # open_perf_buffer for each entry.
-      b.perf_buffer_poll()
-    except ValueError:
-      # Ignore messages from other tracers
-      print("ValueError here")
-      continue
-    except KeyboardInterrupt:
-      exit()
+    if args.ddb_table:
+        print(
+            f"[INFO] Enabling DynamoDB logging to table: {args.ddb_table} (region={args.aws_region}, retention={args.ddb_retention_days} days)",
+            flush=True,
+        )
+        ddb_handler = DynamoDBLogHandler(
+            args.ddb_table, args.aws_region, args.ddb_retention_days
+        )
+        logger.addHandler(ddb_handler)
+        print(f"[INFO] DynamoDBLogHandler initialized and added to logger", flush=True)
+    else:
+        print(
+            "[INFO] No DynamoDB table specified, skipping DynamoDB logging", flush=True
+        )
+
+    # initialize BPF
+    b = BPF(src_file="bpf.c")
+    # Instruments the kernel function event() using kernel dynamic tracing of the function entry, and attaches our C
+    # defined function name() to be called when the kernel function is called.
+    #
+    # kernel update https://github.com/torvalds/linux/commit/81d03e2518945c4bc7b9a7b3f1935203954bf3ba cause the event to not fire, trying previous implementation now in `__sock_sendmsg`
+    # Update: On Kernel 6.8+, __sock_sendmsg might be missing/inlined. sock_sendmsg is reliable.
+    event_list = [
+        "sock_sendmsg",
+        "security_socket_sendmsg",
+        "__sock_sendmsg",
+        "sock_sendmsg_nosec",
+    ]
+    logger.info(
+        "Try to attach multiple kernel functions to make sure the event can be triggered in most cases."
+    )
+
+    print("[INFO] Attempting to attach kprobes...")
+    attached_count = 0
+    for event in event_list:
+        print(f"[INFO] Trying to attach to {event}...")
+        try:
+            b.attach_kprobe(event=event, fn_name="trace_sock_sendmsg")
+            logger.info(f"Successfully attached kprobe to {event}")
+            print(f"[INFO] SUCCESS: Attached kprobe to {event}")
+            attached_count += 1
+        except Exception as exec:
+            logger.info(
+                "Cannot attach kprobe to {}, it depends on your kernels.".format(event)
+            )
+            print(f"[WARN] Failed to attach to {event}: {exec}")
+
+    if attached_count == 0:
+        logger.error(
+            "Failed to attach to ANY kernel functions. The tool cannot function."
+        )
+        print("[FATAL] Failed to attach to ANY kernel functions. Exiting.")
+        exit(1)
+
+    # This operates on a table as defined in BPF via BPF_PERF_OUTPUT() [Defined in C code as imds_events, line 32], and
+    # associates the callback Python function to be called when data is available in the perf ring buffer.
+    b["imds_events"].open_perf_buffer(print_imds_event)
+
+    # header
+    print("Starting ImdsPacketAnalyzer...")
+    print(
+        "Output format: Info Level:[INFO/ERROR...] IMDS version:[IMDSV1/2?] (pid:[pid]:[process name]:argv:[argv]) -> repeats 3 times for parent process"
+    )
+
+    # filter and format output
+    while 1:
+        # Read messages from kernel pipe
+        try:
+            # This polls from all open perf ring buffers, calling the callback function that was provided when calling
+            # open_perf_buffer for each entry.
+            b.perf_buffer_poll()
+        except ValueError:
+            # Ignore messages from other tracers
+            print("ValueError here")
+            continue
+        except KeyboardInterrupt:
+            exit()
